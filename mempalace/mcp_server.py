@@ -21,6 +21,7 @@ Tools (maintenance):
 """
 
 import argparse
+import contextvars
 import os
 import sys
 import json
@@ -49,6 +50,22 @@ def _parse_args():
         "--palace",
         metavar="PATH",
         help="Path to the palace directory (overrides config file and env var)",
+    )
+    parser.add_argument("--serve-http", action="store_true", help="Serve MCP over HTTP instead of stdio")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port (with --serve-http)")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind host (with --serve-http)")
+    parser.add_argument(
+        "--auth",
+        choices=["none", "bearer-static", "oidc-jwt"],
+        default="none",
+        help="Auth mode for HTTP transport",
+    )
+    parser.add_argument("--issuer", help="OIDC issuer URL (with --auth oidc-jwt)")
+    parser.add_argument("--audience", help="Expected token audience (with --auth oidc-jwt)")
+    parser.add_argument(
+        "--token-env",
+        default="MEMPALACE_TOKEN",
+        help="Env var holding the static bearer token (with --auth bearer-static)",
     )
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -88,6 +105,11 @@ try:
 except (OSError, NotImplementedError):
     pass
 _WAL_FILE = _WAL_DIR / "write_log.jsonl"
+# Original import-time WAL path.  _wal_log() re-resolves from HOME on each
+# call so that test harnesses swapping HOME (and the production process if
+# HOME ever changed) land in the right place; but if a test explicitly
+# monkeypatches _WAL_FILE to a different value, we honour that override.
+_WAL_FILE_DEFAULT = _WAL_FILE
 # Pre-create WAL file with restricted permissions to avoid race condition
 if not _WAL_FILE.exists():
     _WAL_FILE.touch(mode=0o600)
@@ -102,6 +124,18 @@ _WAL_REDACT_KEYS = frozenset(
     {"content", "content_preview", "document", "entry", "entry_preview", "query", "text"}
 )
 
+# WAL schema version — bump when the on-disk entry shape changes in a
+# backwards-incompatible way.  Readers (replicas, audit tooling) parse this.
+_WAL_SCHEMA_VERSION = "1"
+
+# Per-call identity for WAL attribution.  Set at the top of handle_request(),
+# read by _wal_log().  Defaults to "anonymous" for the stdio path, where
+# callers do not supply an identity.  A ContextVar keeps the value
+# request-scoped without threading a parameter through every tool handler.
+_wal_identity: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "mempalace_identity", default="anonymous"
+)
+
 
 def _wal_log(operation: str, params: dict, result: dict = None):
     """Append a write operation to the write-ahead log."""
@@ -113,13 +147,28 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         else:
             safe_params[k] = v
     entry = {
+        "schema_version": _WAL_SCHEMA_VERSION,
         "timestamp": datetime.now().isoformat(),
+        "identity": _wal_identity.get(),
         "operation": operation,
         "params": safe_params,
         "result": result,
     }
+    # Pick the WAL path: an explicit monkeypatch of _WAL_FILE wins;
+    # otherwise re-resolve from the current HOME so tests that swap HOME
+    # (and any runtime HOME change) land in the right place.
+    if _WAL_FILE != _WAL_FILE_DEFAULT:
+        wal_file = _WAL_FILE
+        wal_dir = wal_file.parent
+    else:
+        wal_dir = Path(os.path.expanduser("~/.mempalace/wal"))
+        wal_file = wal_dir / "write_log.jsonl"
     try:
-        fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        wal_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        fd = os.open(str(wal_file), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
@@ -1035,6 +1084,19 @@ def tool_reconnect():
 
 # ==================== MCP PROTOCOL ====================
 
+# Tool names whose handlers mutate palace state. The HTTP transport (see
+# mempalace.transport.http) serialises these through writer_lock to prevent
+# concurrent index corruption and interleaved WAL writes. Stdio doesn't need
+# this (single-threaded event loop), but the set is still authoritative.
+WRITE_TOOL_NAMES: frozenset[str] = frozenset({
+    "mempalace_add_drawer",
+    "mempalace_delete_drawer",
+    "mempalace_update_drawer",
+    "mempalace_diary_write",
+    "mempalace_kg_add",
+    "mempalace_kg_invalidate",
+})
+
 TOOLS = {
     "mempalace_status": {
         "description": "Palace overview — total drawers, wing and room counts",
@@ -1403,7 +1465,12 @@ SUPPORTED_PROTOCOL_VERSIONS = [
 ]
 
 
-def handle_request(request):
+def handle_request(request, identity: str = "anonymous"):
+    # Bind the caller's identity for the duration of this request so the
+    # WAL writer can attribute writes without threading a parameter through
+    # every tool handler.  stdio callers do not supply identity and get
+    # "anonymous"; future HTTP transport will pass an authenticated subject.
+    _wal_identity.set(identity or "anonymous")
     method = request.get("method") or ""
     params = request.get("params") or {}
     req_id = request.get("id")
@@ -1510,24 +1577,28 @@ def handle_request(request):
 
 
 def main():
-    logger.info("MemPalace MCP Server starting...")
-    while True:
-        try:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            request = json.loads(line)
-            response = handle_request(request)
-            if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
+    """Entry point for `python -m mempalace.mcp_server`. Dispatches to the selected transport."""
+    args = _parse_args()
+    if args.serve_http:
+        from mempalace.transport.http import build_app
+        from mempalace.auth.bearer_static import BearerStaticAuth
+        from mempalace.auth.oidc_jwt import OIDCJWTAuth
+        import uvicorn
+
+        if args.auth == "bearer-static":
+            auth = BearerStaticAuth(token_env=args.token_env)
+        elif args.auth == "oidc-jwt":
+            if not args.issuer or not args.audience:
+                raise SystemExit("--auth oidc-jwt requires --issuer and --audience")
+            auth = OIDCJWTAuth(issuer=args.issuer, audience=args.audience)
+        else:
+            auth = None
+
+        app = build_app(auth=auth)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    else:
+        from mempalace.transport.stdio import serve
+        serve()
 
 
 if __name__ == "__main__":
