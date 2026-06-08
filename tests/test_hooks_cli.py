@@ -205,11 +205,12 @@ def test_session_start_passes_through(tmp_path):
 
 
 def test_precompact_always_blocks(tmp_path):
-    result = _capture_hook_output(
-        hook_precompact,
-        {"session_id": "test"},
-        state_dir=tmp_path,
-    )
+    with patch("subprocess.run"):
+        result = _capture_hook_output(
+            hook_precompact,
+            {"session_id": "test"},
+            state_dir=tmp_path,
+        )
     assert result["decision"] == "block"
     assert result["reason"] == PRECOMPACT_BLOCK_REASON
 
@@ -397,7 +398,8 @@ def test_run_hook_dispatches_precompact(tmp_path):
     with patch("sys.stdin", io.StringIO(stdin_data)):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._output") as mock_output:
-                run_hook("precompact", "claude-code")
+                with patch("subprocess.run"):
+                    run_hook("precompact", "claude-code")
     mock_output.assert_called_once()
     call_args = mock_output.call_args[0][0]
     assert call_args["decision"] == "block"

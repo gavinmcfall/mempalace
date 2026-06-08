@@ -95,6 +95,16 @@ def _output(data: dict):
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def _build_mine_cmd(mempal_dir: str) -> list:
+    """Build the mine command, optionally targeting a remote HTTP server."""
+    cmd = [sys.executable, "-m", "mempalace", "mine", mempal_dir, "--mode", "convos"]
+    remote_url = os.environ.get("MEMPAL_REMOTE_URL", "")
+    remote_token = os.environ.get("MEMPALACE_TOKEN", "")
+    if remote_url and remote_token:
+        cmd += ["--remote-url", remote_url, "--remote-token", remote_token]
+    return cmd
+
+
 def _maybe_auto_ingest():
     """If MEMPAL_DIR is set and exists, run mempalace mine in background."""
     mempal_dir = os.environ.get("MEMPAL_DIR", "")
@@ -103,7 +113,7 @@ def _maybe_auto_ingest():
             log_path = STATE_DIR / "hook.log"
             with open(log_path, "a") as log_f:
                 subprocess.Popen(
-                    [sys.executable, "-m", "mempalace", "mine", mempal_dir],
+                    _build_mine_cmd(mempal_dir),
                     stdout=log_f,
                     stderr=log_f,
                 )
@@ -200,7 +210,7 @@ def hook_precompact(data: dict, harness: str):
             log_path = STATE_DIR / "hook.log"
             with open(log_path, "a") as log_f:
                 subprocess.run(
-                    [sys.executable, "-m", "mempalace", "mine", mempal_dir],
+                    _build_mine_cmd(mempal_dir),
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
