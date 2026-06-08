@@ -65,6 +65,7 @@ class RemoteCollection(BaseCollection):
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Content-Type": "application/json",
+                "User-Agent": "mempalace-mine/1.0",
             },
             method="POST",
         )
