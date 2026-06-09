@@ -112,6 +112,13 @@ def _build_mine_cmd(mempal_dir: str) -> list:
     if remote_url and remote_token:
         cmd += ["--remote-url", remote_url, "--remote-token", remote_token]
 
+    # Attribute auto-saved drawers to a named author. In a shared palace this
+    # is how each person's contributions are distinguished (added_by). Without
+    # it, hook-saved drawers default to the generic "mempalace" agent.
+    agent = os.environ.get("MEMPAL_AGENT", "")
+    if agent:
+        cmd += ["--agent", agent]
+
     flock_bin = shutil.which("flock")
     if flock_bin:
         lock_path = STATE_DIR / "mine.lock"

@@ -304,6 +304,27 @@ def test_build_mine_cmd_remote(tmp_path):
     assert "tok" in cmd
 
 
+def test_build_mine_cmd_agent(tmp_path):
+    """MEMPAL_AGENT adds --agent for per-author attribution."""
+    from mempalace.hooks_cli import _build_mine_cmd
+
+    with patch.dict("os.environ", {"MEMPAL_AGENT": "gavin"}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            cmd = _build_mine_cmd("/some/dir")
+    assert "--agent" in cmd
+    assert cmd[cmd.index("--agent") + 1] == "gavin"
+
+
+def test_build_mine_cmd_no_agent(tmp_path):
+    """Without MEMPAL_AGENT, no --agent flag is added (mine uses its default)."""
+    from mempalace.hooks_cli import _build_mine_cmd
+
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            cmd = _build_mine_cmd("/some/dir")
+    assert "--agent" not in cmd
+
+
 def test_build_mine_cmd_flock_wraps_when_available(tmp_path):
     """When flock is on PATH, the command is wrapped with flock -n."""
     from mempalace.hooks_cli import _build_mine_cmd
