@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from starlette.concurrency import run_in_threadpool
 
 from mempalace.auth import AuthError, AuthMiddleware
 from mempalace.concurrency import writer_lock
@@ -83,13 +84,21 @@ def build_app(auth: AuthMiddleware | None) -> FastAPI:
         tool_name = _extract_tool_name(payload)
         tool_label = tool_name or "unknown"
 
+        # handle_request is synchronous and can block for seconds (loading the
+        # HNSW index, running a search). Run it in a threadpool so the asyncio
+        # event loop stays free to answer /healthz and /readyz — otherwise a
+        # single heavy query stalls the liveness probe and the pod is killed.
         start = time.perf_counter()
         try:
             if tool_name in WRITE_TOOL_NAMES:
                 async with writer_lock:
-                    response = handle_request(payload, identity=identity)
+                    response = await run_in_threadpool(
+                        handle_request, payload, identity=identity
+                    )
             else:
-                response = handle_request(payload, identity=identity)
+                response = await run_in_threadpool(
+                    handle_request, payload, identity=identity
+                )
         finally:
             DURATION.labels(tool=tool_label).observe(time.perf_counter() - start)
 
