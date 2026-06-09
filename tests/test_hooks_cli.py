@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,12 +109,22 @@ def test_count_malformed_json_lines(tmp_path):
 # --- hook_stop ---
 
 
-def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
-    """Run a hook and capture its JSON stdout output."""
+def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None, mock_subprocess=True):
+    """Run a hook and capture its JSON stdout output.
+
+    By default mocks subprocess so the auto-ingest path never spawns a real
+    ``mempalace mine`` — otherwise, with MEMPAL_DIR set in the environment,
+    hook tests would launch real mines against the configured palace. Tests
+    that want to assert on subprocess themselves pass mock_subprocess=False
+    and set up their own patch.
+    """
     import io
 
     buf = io.StringIO()
     patches = [patch("mempalace.hooks_cli._output", side_effect=lambda d: buf.write(json.dumps(d)))]
+    if mock_subprocess:
+        patches.append(patch("mempalace.hooks_cli.subprocess.Popen"))
+        patches.append(patch("mempalace.hooks_cli.subprocess.run"))
     if state_dir:
         patches.append(patch("mempalace.hooks_cli.STATE_DIR", state_dir))
     with contextlib.ExitStack() as stack:
@@ -205,12 +216,11 @@ def test_session_start_passes_through(tmp_path):
 
 
 def test_precompact_always_blocks(tmp_path):
-    with patch("subprocess.run"):
-        result = _capture_hook_output(
-            hook_precompact,
-            {"session_id": "test"},
-            state_dir=tmp_path,
-        )
+    result = _capture_hook_output(
+        hook_precompact,
+        {"session_id": "test"},
+        state_dir=tmp_path,
+    )
     assert result["decision"] == "block"
     assert result["reason"] == PRECOMPACT_BLOCK_REASON
 
@@ -263,6 +273,60 @@ def test_maybe_auto_ingest_oserror(tmp_path):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("fail")):
                 _maybe_auto_ingest()  # should not raise
+
+
+# --- _build_mine_cmd ---
+
+
+def test_build_mine_cmd_local_only(tmp_path):
+    """Without MEMPAL_REMOTE_URL, no remote flags are added."""
+    from mempalace.hooks_cli import _build_mine_cmd
+
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            cmd = _build_mine_cmd("/some/dir")
+    assert "--mode" in cmd and "convos" in cmd
+    assert "--remote-url" not in cmd
+    assert "--remote-token" not in cmd
+
+
+def test_build_mine_cmd_remote(tmp_path):
+    """With MEMPAL_REMOTE_URL + MEMPALACE_TOKEN, remote flags are added."""
+    from mempalace.hooks_cli import _build_mine_cmd
+
+    env = {"MEMPAL_REMOTE_URL": "https://palace.test", "MEMPALACE_TOKEN": "tok"}
+    with patch.dict("os.environ", env, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            cmd = _build_mine_cmd("/some/dir")
+    assert "--remote-url" in cmd
+    assert "https://palace.test" in cmd
+    assert "--remote-token" in cmd
+    assert "tok" in cmd
+
+
+def test_build_mine_cmd_flock_wraps_when_available(tmp_path):
+    """When flock is on PATH, the command is wrapped with flock -n."""
+    from mempalace.hooks_cli import _build_mine_cmd
+
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.shutil.which", return_value="/usr/bin/flock"):
+                cmd = _build_mine_cmd("/some/dir")
+    assert cmd[0] == "/usr/bin/flock"
+    assert cmd[1] == "-n"
+    assert str(tmp_path / "mine.lock") == cmd[2]
+
+
+def test_build_mine_cmd_no_flock_falls_back(tmp_path):
+    """When flock is absent, the command runs unwrapped."""
+    from mempalace.hooks_cli import _build_mine_cmd
+
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.shutil.which", return_value=None):
+                cmd = _build_mine_cmd("/some/dir")
+    assert "flock" not in cmd[0]
+    assert cmd[0] == sys.executable
 
 
 # --- _parse_harness_input ---
@@ -342,6 +406,7 @@ def test_precompact_with_mempal_dir(tmp_path):
                 hook_precompact,
                 {"session_id": "test"},
                 state_dir=tmp_path,
+                mock_subprocess=False,
             )
     assert result["decision"] == "block"
     mock_run.assert_called_once()
@@ -357,6 +422,7 @@ def test_precompact_with_mempal_dir_oserror(tmp_path):
                 hook_precompact,
                 {"session_id": "test"},
                 state_dir=tmp_path,
+                mock_subprocess=False,
             )
     assert result["decision"] == "block"
 
@@ -398,7 +464,7 @@ def test_run_hook_dispatches_precompact(tmp_path):
     with patch("sys.stdin", io.StringIO(stdin_data)):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._output") as mock_output:
-                with patch("subprocess.run"):
+                with patch("mempalace.hooks_cli.subprocess.run"):
                     run_hook("precompact", "claude-code")
     mock_output.assert_called_once()
     call_args = mock_output.call_args[0][0]
