@@ -9,6 +9,7 @@ Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -96,12 +97,25 @@ def _output(data: dict):
 
 
 def _build_mine_cmd(mempal_dir: str) -> list:
-    """Build the mine command, optionally targeting a remote HTTP server."""
+    """Build the mine command, optionally targeting a remote HTTP server.
+
+    Wrapped with ``flock -n`` (when available) so concurrent hook fires and the
+    weekly cron never run overlapping mines — a slow backlog would otherwise
+    stack up a new process on every checkpoint. ``flock -n`` exits immediately
+    (code 1, no-op) if a mine already holds the lock. When flock is missing
+    (e.g. macOS), we fall back to running unlocked; the server still dedupes by
+    content hash, so the worst case is wasted work, not duplicate drawers.
+    """
     cmd = [sys.executable, "-m", "mempalace", "mine", mempal_dir, "--mode", "convos"]
     remote_url = os.environ.get("MEMPAL_REMOTE_URL", "")
     remote_token = os.environ.get("MEMPALACE_TOKEN", "")
     if remote_url and remote_token:
         cmd += ["--remote-url", remote_url, "--remote-token", remote_token]
+
+    flock_bin = shutil.which("flock")
+    if flock_bin:
+        lock_path = STATE_DIR / "mine.lock"
+        return [flock_bin, "-n", str(lock_path)] + cmd
     return cmd
 
 
