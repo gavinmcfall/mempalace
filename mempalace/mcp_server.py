@@ -258,25 +258,26 @@ def _no_palace():
 
 
 def _fetch_all_metadata(col, where=None):
-    """Paginate col.get() to avoid the 10K silent truncation limit."""
+    """Fetch all drawer metadata in a single call.
+
+    A passing ``limit`` equal to the collection size overrides ChromaDB's
+    default 10K silent-truncation cap and returns everything in one query.
+    This avoids offset pagination, whose per-page cost grows with the offset
+    (O(n²) overall) — on a 320k-drawer palace that was ~51s vs ~6s here.
+    """
     total = col.count()
-    all_meta = []
-    offset = 0
-    while offset < total:
-        kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
-        if where:
-            kwargs["where"] = where
-        batch = col.get(**kwargs)
-        if not batch["metadatas"]:
-            break
-        all_meta.extend(batch["metadatas"])
-        offset += len(batch["metadatas"])
-    return all_meta
+    if total == 0:
+        return []
+    kwargs = {"include": ["metadatas"], "limit": total}
+    if where:
+        kwargs["where"] = where
+    batch = col.get(**kwargs)
+    return batch.get("metadatas") or []
 
 
 _metadata_cache = None
 _metadata_cache_time = 0
-_METADATA_CACHE_TTL = 5.0  # seconds
+_METADATA_CACHE_TTL = 300.0  # seconds; invalidated early on writes via _get_client mtime check
 _MAX_RESULTS = 100  # upper bound for search/list limit params
 
 
