@@ -13,8 +13,17 @@
 **Key facts:**
 - Cluster Postgres primary: `10.90.3.210:5432`, superuser `postgres` (pw in `~/.secrets` `CNPG_PASSWORD`). pgvector `vector` 0.8.1 available, not yet installed.
 - Source palace: ChromaDB at k8s `cortex/mempalace` PVC, collection `mempalace_drawers`, **323,931 drawers, dim 384, L2 space**, all `added_by=gavin`.
-- Upstream pgvector env: `MEMPALACE_BACKEND=pgvector`, `MEMPALACE_PGVECTOR_LIVE_URL=<dsn>`; CLI `--backend pgvector`.
 - Upstream has **no** HTTP transport (fork-only). Path B retires it.
+
+**GATE 0 SPIKE RESULTS (2026-06-09) — verified against upstream develop, corrections applied below:**
+- ✅ Vector transfer works — embedder-identity contract only WARNS on absent-sidecar+populated, only hard-fails on genuine model/dim mismatch. Foreign 384-dim vectors insert/persist/serve. **No re-embed.**
+- ⚠️ **Env var correction:** runtime DSN is **`MEMPALACE_PGVECTOR_DSN`** (NOT `MEMPALACE_PGVECTOR_LIVE_URL` — that var only gates the test suite). Options dict also accepts `dsn`/`url`.
+- ⚠️ **`MEMPALACE_PALACE_PATH` is REQUIRED** even with pgvector — the backend anchors a local mismatch-protection marker; pure-remote (no local path) raises. So every client sets BOTH a local palace path AND the pgvector DSN.
+- **Table name:** `mempalace_<sha256(palace_path)[:16]>_mempalace_drawers` — depends on the palace PATH, not hardcodable. Compute from the production path for parity checks.
+- **Embedder identity:** declare with `mempalace palace set-embedder --model minilm` (the recorded name is `minilm`, dim 384 — NOT "all-MiniLM-L6-v2"). Suppresses the warning, formally satisfies RFC 001.
+- **pip extra:** `pgvector` (pulls `psycopg[binary]`). Backends available: chroma, pgvector, qdrant, sqlite_exact.
+- **MCP stdio entrypoint:** `python -m mempalace.mcp_server` with the env vars above.
+- Search is hybrid (BM25 + vector); lexical leg works even before vectors are semantically meaningful.
 
 ---
 
@@ -113,7 +122,7 @@ Expected: a JSON-RPC result containing the `beta doc about postgres` drawer.
 docker rm -f mp-pgtest
 ```
 
-**GATE 0 (overall):** All three tasks green → assumptions hold, proceed to Phase 1. Record the confirmed env-var names and the transfer verdict in this file before continuing.
+**GATE 0 (overall): ✅ GREEN — PASSED 2026-06-09.** All three assumptions verified (see "GATE 0 SPIKE RESULTS" in the header). Vector transfer viable, no re-embed, env vars corrected. Proceed to Phase 1.
 
 ---
 
