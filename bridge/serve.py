@@ -66,13 +66,17 @@ except Exception as exc:  # import/patch-time fallback: run unpatched
 try:
     import os as _os
 
-    def tool_ingest_transcript(content, filename="session.jsonl", agent=None):
+    def tool_ingest_transcript(content, filename="session.jsonl", agent=None, wing="projects"):
         import tempfile
         import subprocess
 
         try:
             palace_path = _os.environ.get("MEMPALACE_PALACE_PATH", "/data/palace")
             ag = (agent or _os.environ.get("MEMPAL_AGENT") or "mempalace")
+            # Default wing "projects" matches the existing conversation corpus
+            # (the original `mine ~/.claude/projects` put convos under "projects").
+            # Without this the wing would default to the temp-dir name.
+            wg = wing or "projects"
             d = tempfile.mkdtemp(prefix="mp_ingest_")
             base = _os.path.basename(filename or "session.jsonl")
             if not base.endswith(".jsonl"):
@@ -83,8 +87,8 @@ try:
             # repr() makes all interpolations safe Python string literals.
             code = (
                 "from mempalace.convo_miner import mine_convos;"
-                f"mine_convos({d!r}, palace_path={palace_path!r}, agent={ag!r}, "
-                "extract_mode='exchange');"
+                f"mine_convos({d!r}, palace_path={palace_path!r}, wing={wg!r}, "
+                f"agent={ag!r}, extract_mode='exchange');"
                 f"import shutil; shutil.rmtree({d!r}, ignore_errors=True)"
             )
             log = open("/data/ingest.log", "a")
@@ -113,6 +117,8 @@ try:
                              "description": "Original filename (optional)"},
                 "agent": {"type": "string",
                           "description": "Attribution agent name, e.g. gavin"},
+                "wing": {"type": "string",
+                         "description": "Target wing (default 'projects')"},
             },
             "required": ["content"],
         },
