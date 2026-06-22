@@ -1,6 +1,6 @@
 #!/bin/sh
 # MemPalace bridge entrypoint: ensure palace markers exist (idempotent, guarded),
-# then run mcp-proxy in front of the patched stdio MCP server.
+# then run supergateway in front of the patched stdio MCP server.
 set -e
 
 : "${MEMPALACE_BACKEND:=pgvector}"
@@ -33,4 +33,12 @@ print("[entrypoint] marker written")
 PY
 fi
 
-exec mcp-proxy --port "${BRIDGE_PORT:-8080}" --host 0.0.0.0 --pass-environment -- python /app/serve.py
+# supergateway wraps the patched stdio MCP server and exposes it over
+# streamable-http at /mcp (Claude Code compatible). It inherits this env (incl.
+# MEMPALACE_PGVECTOR_DSN) and passes it to the child stdio process.
+exec supergateway \
+  --stdio "python /app/serve.py" \
+  --outputTransport streamableHttp \
+  --streamableHttpPath /mcp \
+  --healthEndpoint /healthz \
+  --port "${BRIDGE_PORT:-8080}"
