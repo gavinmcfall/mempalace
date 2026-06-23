@@ -85,11 +85,19 @@ try:
             with open(fp, "w", encoding="utf-8") as f:
                 f.write(content or "")
             # repr() makes all interpolations safe Python string literals.
+            # Serialize mines with an exclusive lock acquired BEFORE the heavy
+            # mempalace import / model load: concurrent auto-saves (several
+            # sessions ending at once) would each load onnxruntime (~2GB on a
+            # 20-core node) and OOM the pod. Waiting processes stay tiny (just
+            # fcntl) until they hold the lock, then mine one at a time.
             code = (
+                "import fcntl, shutil;"
+                "lf = open('/data/mine.lock', 'a');"
+                "fcntl.flock(lf, fcntl.LOCK_EX);"
                 "from mempalace.convo_miner import mine_convos;"
                 f"mine_convos({d!r}, palace_path={palace_path!r}, wing={wg!r}, "
                 f"agent={ag!r}, extract_mode='exchange');"
-                f"import shutil; shutil.rmtree({d!r}, ignore_errors=True)"
+                f"shutil.rmtree({d!r}, ignore_errors=True)"
             )
             log = open("/data/ingest.log", "a")
             subprocess.Popen(
