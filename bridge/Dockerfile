@@ -22,6 +22,18 @@ RUN apt-get update \
     && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Raise supergateway's HTTP body limit. It calls express.json() with no options,
+# so Express defaults to a 100kb body limit — full Claude transcript ingests
+# (mempalace_ingest_transcript) are MBs and were silently rejected with
+# "PayloadTooLargeError: request entity too large", so nothing got saved.
+# supergateway 3.4.3 exposes no flag for this, so patch the pinned dist. The grep
+# guard fails the build if a version bump changes the express.json() call shape.
+RUN SG=/usr/lib/node_modules/supergateway/dist/gateways \
+    && sed -i "s/express\.json()/express.json({ limit: '50mb' })/g" \
+         "$SG/stdioToStatefulStreamableHttp.js" \
+         "$SG/stdioToStatelessStreamableHttp.js" \
+    && grep -q "limit: '50mb'" "$SG/stdioToStatefulStreamableHttp.js"
+
 COPY bridge/serve.py /app/serve.py
 COPY bridge/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
