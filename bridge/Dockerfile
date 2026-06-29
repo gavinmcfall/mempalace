@@ -6,8 +6,13 @@
 # Pinned upstream + supergateway versions so upgrades are deliberate.
 FROM python:3.12-slim-bookworm
 
-# Pin: MemPalace develop @ this commit (validated 2026-06-19, reports 3.4.1).
-ARG MEMPALACE_REF=afa749c141e60cf9c797c602f0d667e722fa0a75
+# Pin: MemPalace develop @ this commit (2026-06-28, post-v3.5.0). Bumped from
+# afa749c1 (3.4.1) for the large-palace fixes that unblock mining on the 419k
+# shared palace: SQL-pushdown pagination for pgvector get() (#1840) and skip the
+# document column on metadata-only fetches (#1892) — together they kill the
+# full-table O(n×doc) fetch that stalled every mine — plus surrogate/NUL
+# mine-abort fixes (#1833/#1829) and an ONNX intra-op thread cap (#1068).
+ARG MEMPALACE_REF=8ec284db5dc57afd9fde1402a3912e71382dac6e
 ARG SUPERGATEWAY_VERSION=3.4.3
 
 RUN pip install --no-cache-dir \
