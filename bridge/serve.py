@@ -66,46 +66,83 @@ except Exception as exc:  # import/patch-time fallback: run unpatched
 try:
     import os as _os
 
+    def _spawn_subprocess_mine(d, palace_path, wg, ag):
+        # Fallback path (daemon unavailable): one-shot DETACHED mine that loads
+        # onnxruntime fresh (~2GB). repr() makes interpolations safe literals; the
+        # flock serializes concurrent fallbacks so they don't double-load and OOM.
+        import subprocess
+        code = (
+            "import fcntl, shutil;"
+            "lf = open('/data/mine.lock', 'a');"
+            "fcntl.flock(lf, fcntl.LOCK_EX);"
+            "from mempalace.convo_miner import mine_convos;"
+            f"mine_convos({d!r}, palace_path={palace_path!r}, wing={wg!r}, "
+            f"agent={ag!r}, extract_mode='exchange');"
+            f"shutil.rmtree({d!r}, ignore_errors=True)"
+        )
+        log = open("/data/ingest.log", "a")
+        subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=log, stderr=log, env=_os.environ, start_new_session=True,
+        )
+
     def tool_ingest_transcript(content, filename="session.jsonl", agent=None, wing="projects"):
         import tempfile
-        import subprocess
+        import glob
+        import time
+        import shutil
+        import hashlib
 
         try:
             palace_path = _os.environ.get("MEMPALACE_PALACE_PATH", "/data/palace")
             ag = (agent or _os.environ.get("MEMPAL_AGENT") or "mempalace")
             # Default wing "projects" matches the existing conversation corpus
             # (the original `mine ~/.claude/projects` put convos under "projects").
-            # Without this the wing would default to the temp-dir name.
             wg = wing or "projects"
+            # Lazy GC: the daemon mines the temp dir async and doesn't remove it,
+            # so drop ingest temp dirs older than 6h (the queue never backs up
+            # anywhere near that, so this can't race an unmined dir).
+            cutoff = time.time() - 6 * 3600
+            for old in glob.glob("/tmp/mp_ingest_*"):
+                try:
+                    if _os.path.getmtime(old) < cutoff:
+                        shutil.rmtree(old, ignore_errors=True)
+                except OSError:
+                    pass
             d = tempfile.mkdtemp(prefix="mp_ingest_")
             base = _os.path.basename(filename or "session.jsonl")
             if not base.endswith(".jsonl"):
                 base += ".jsonl"
-            fp = _os.path.join(d, base)
-            with open(fp, "w", encoding="utf-8") as f:
+            with open(_os.path.join(d, base), "w", encoding="utf-8") as f:
                 f.write(content or "")
-            # repr() makes all interpolations safe Python string literals.
-            # Serialize mines with an exclusive lock acquired BEFORE the heavy
-            # mempalace import / model load: concurrent auto-saves (several
-            # sessions ending at once) would each load onnxruntime (~2GB on a
-            # 20-core node) and OOM the pod. Waiting processes stay tiny (just
-            # fcntl) until they hold the lock, then mine one at a time.
-            code = (
-                "import fcntl, shutil;"
-                "lf = open('/data/mine.lock', 'a');"
-                "fcntl.flock(lf, fcntl.LOCK_EX);"
-                "from mempalace.convo_miner import mine_convos;"
-                f"mine_convos({d!r}, palace_path={palace_path!r}, wing={wg!r}, "
-                f"agent={ag!r}, extract_mode='exchange');"
-                f"shutil.rmtree({d!r}, ignore_errors=True)"
-            )
-            log = open("/data/ingest.log", "a")
-            subprocess.Popen(
-                [sys.executable, "-c", code],
-                stdout=log, stderr=log, env=_os.environ, start_new_session=True,
-            )
-            return {"success": True, "queued": True,
-                    "bytes": len(content or ""), "agent": ag}
+            # Preferred path: hand the mine to the local daemon — ONE long-lived
+            # process loads the embedder once and serializes mines, instead of a
+            # fresh ~2GB onnxruntime subprocess per ingest (which OOM-killed the
+            # pod). auto_start spins the daemon up on first use and reuses it
+            # after; the content-hash dedupe_key collapses repeat saves of an
+            # unchanged transcript so a growing session isn't re-mined every stop.
+            try:
+                from mempalace.daemon import submit_job
+                dk = "bridge-ingest:" + hashlib.sha256(
+                    (base + "\x00" + (content or "")).encode("utf-8", "surrogatepass")
+                ).hexdigest()[:24]
+                submit_job(
+                    "mine",
+                    {"source": d, "mode": "convos", "wing": wg, "agent": ag,
+                     "extract": "exchange", "limit": 0, "dry_run": False},
+                    palace_path=palace_path,
+                    dedupe_key=dk,
+                    wait=False,
+                    auto_start=True,
+                )
+                return {"success": True, "queued": True, "via": "daemon",
+                        "bytes": len(content or ""), "agent": ag}
+            except Exception as exc:  # daemon unavailable -> degraded but works
+                print(f"[serve.py] daemon submit failed ({exc!r}); falling back "
+                      f"to one-shot subprocess mine", file=sys.stderr)
+                _spawn_subprocess_mine(d, palace_path, wg, ag)
+                return {"success": True, "queued": True, "via": "subprocess",
+                        "bytes": len(content or ""), "agent": ag}
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "error": str(exc)}
 
