@@ -1,0 +1,19 @@
+{
+	admin off
+	persist_config off
+	auto_https off
+}
+
+# Public listener. Reverse-proxies to the loopback-bound native MCP HTTP server
+# (serve.py --transport http on 127.0.0.1:8765). The native server pins Host to
+# loopback literals as a DNS-rebinding guard, so rewrite Host to the bound
+# loopback value and strip any browser Origin (non-browser MCP clients omit it;
+# the guard would reject a present non-loopback Origin). flush_interval -1 keeps
+# streamable-http / SSE responses unbuffered.
+:8080 {
+	reverse_proxy 127.0.0.1:8765 {
+		header_up Host 127.0.0.1:8765
+		header_up -Origin
+		flush_interval -1
+	}
+}

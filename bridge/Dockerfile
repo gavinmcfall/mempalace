@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1.7
-# MemPalace LAN bridge: upstream mempalace (pgvector) behind supergateway
-# (stdio -> streamablehttp). supergateway is used instead of mcp-proxy because
-# mcp-proxy 0.12.0's streamable-http is incompatible with Claude Code's MCP
-# client (handshake OK, tools/list fails); supergateway works with it.
-# Pinned upstream + supergateway versions so upgrades are deliberate.
+# MemPalace LAN bridge: mempalace's NATIVE HTTP MCP transport (one process) behind
+# caddy (Host-rewriting reverse proxy). Replaces the old supergateway stdio->http
+# bridge, whose STATEFUL transport spawned one serve.py child per MCP session and
+# never reaped orphans — ~90 leaked processes (~5.8Gi) OOMKilled the pod daily.
+# serve.py now runs `mempalace.mcp_server --transport http` on loopback; caddy on
+# :8080 rewrites Host to the loopback literal so the DNS-rebinding Host-pin accepts
+# proxied requests (keeps clients unchanged — no bearer token needed).
 FROM python:3.12-slim-bookworm
 
 # Pin: MemPalace develop @ this commit (2026-06-28, post-v3.5.0). Bumped from
@@ -13,35 +15,28 @@ FROM python:3.12-slim-bookworm
 # full-table O(n×doc) fetch that stalled every mine — plus surrogate/NUL
 # mine-abort fixes (#1833/#1829) and an ONNX intra-op thread cap (#1068).
 ARG MEMPALACE_REF=8ec284db5dc57afd9fde1402a3912e71382dac6e
-ARG SUPERGATEWAY_VERSION=3.4.3
+ARG CADDY_VERSION=2.8.4
 
 RUN pip install --no-cache-dir \
       "mempalace[pgvector] @ https://github.com/MemPalace/mempalace/archive/${MEMPALACE_REF}.tar.gz"
 
-# Node + supergateway (stdio->streamableHttp bridge)
+# caddy — Host-rewriting reverse proxy in front of the loopback-bound native MCP
+# HTTP server. One well-behaved proxy process (no per-session spawning), so it
+# does not reintroduce the supergateway leak. curl is only needed to fetch it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g "supergateway@${SUPERGATEWAY_VERSION}" \
-    && apt-get purge -y curl gnupg && apt-get autoremove -y \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+       | tar -xz -C /usr/local/bin caddy \
+    && chmod +x /usr/local/bin/caddy \
+    && /usr/local/bin/caddy version \
+    && apt-get purge -y curl && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Raise supergateway's HTTP body limit. It calls express.json() with no options,
-# so Express defaults to a 100kb body limit — full Claude transcript ingests
-# (mempalace_ingest_transcript) are MBs and were silently rejected with
-# "PayloadTooLargeError: request entity too large", so nothing got saved.
-# supergateway 3.4.3 exposes no flag for this, so patch the pinned dist. The grep
-# guard fails the build if a version bump changes the express.json() call shape.
-RUN SG=/usr/lib/node_modules/supergateway/dist/gateways \
-    && sed -i "s/express\.json()/express.json({ limit: '50mb' })/g" \
-         "$SG/stdioToStatefulStreamableHttp.js" \
-         "$SG/stdioToStatelessStreamableHttp.js" \
-    && grep -q "limit: '50mb'" "$SG/stdioToStatefulStreamableHttp.js"
-
 COPY bridge/serve.py /app/serve.py
+COPY bridge/Caddyfile /app/Caddyfile
 COPY bridge/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh \
+    && caddy validate --config /app/Caddyfile --adapter caddyfile
 
 ENV MEMPALACE_BACKEND=pgvector \
     MEMPALACE_PALACE_PATH=/data/palace \

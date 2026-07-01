@@ -55,19 +55,24 @@ with psycopg.connect(os.environ["MEMPALACE_PGVECTOR_DSN"], autocommit=True) as c
 print("[entrypoint] gin index ensured on", table)
 PY
 
-# supergateway wraps the patched stdio MCP server and exposes it over
-# streamable-http at /mcp (Claude Code compatible). It inherits this env (incl.
-# MEMPALACE_PGVECTOR_DSN) and passes it to the child stdio process.
-#
-# --sessionTimeout is REQUIRED: stateful streamableHttp spawns one serve.py stdio
-# child per MCP session, and WITHOUT a timeout idle/abandoned sessions are never
-# reaped. Many clients reconnecting (8 live Claude sessions) piled up ~90 serve.py
-# children (~5.8Gi) over a day and OOMKilled the pod. 10min reaps idle sessions;
-# active clients keep theirs alive and abandoned ones get cleaned up.
-exec supergateway \
-  --stdio "python /app/serve.py" \
-  --outputTransport streamableHttp \
-  --streamableHttpPath /mcp \
-  --healthEndpoint /healthz \
-  --sessionTimeout 600000 \
-  --port "${BRIDGE_PORT:-8080}"
+# Run the NATIVE MCP HTTP transport (one ThreadingHTTPServer process, no
+# per-session spawning) on loopback, with caddy in front on :8080. This replaces
+# supergateway, whose stateful stdio->http bridge spawned one serve.py per MCP
+# session and never reaped orphans — ~90 leaked processes (~5.8Gi) OOMKilled the
+# pod daily. serve.py imports mcp_server as M and calls M.main(), which parses
+# these args and serves HTTP with the custom ingest tool + status patch registered.
+# The native server pins Host to loopback (DNS-rebinding guard); caddy rewrites
+# Host to 127.0.0.1:8765 so proxied requests are accepted — clients stay unchanged.
+python /app/serve.py --transport http --host 127.0.0.1 --port 8765 &
+SERVE_PID=$!
+caddy run --config /app/Caddyfile --adapter caddyfile &
+CADDY_PID=$!
+
+# POSIX supervisor (dash has no `wait -n`): if either process exits, tear the
+# other down and exit non-zero so Kubernetes restarts the container.
+while kill -0 "$SERVE_PID" 2>/dev/null && kill -0 "$CADDY_PID" 2>/dev/null; do
+  sleep 5
+done
+echo "[entrypoint] serve.py ($SERVE_PID) or caddy ($CADDY_PID) exited; shutting down"
+kill "$SERVE_PID" "$CADDY_PID" 2>/dev/null
+exit 1
