@@ -58,9 +58,16 @@ PY
 # supergateway wraps the patched stdio MCP server and exposes it over
 # streamable-http at /mcp (Claude Code compatible). It inherits this env (incl.
 # MEMPALACE_PGVECTOR_DSN) and passes it to the child stdio process.
+#
+# --sessionTimeout is REQUIRED: stateful streamableHttp spawns one serve.py stdio
+# child per MCP session, and WITHOUT a timeout idle/abandoned sessions are never
+# reaped. Many clients reconnecting (8 live Claude sessions) piled up ~90 serve.py
+# children (~5.8Gi) over a day and OOMKilled the pod. 10min reaps idle sessions;
+# active clients keep theirs alive and abandoned ones get cleaned up.
 exec supergateway \
   --stdio "python /app/serve.py" \
   --outputTransport streamableHttp \
   --streamableHttpPath /mcp \
   --healthEndpoint /healthz \
+  --sessionTimeout 600000 \
   --port "${BRIDGE_PORT:-8080}"
